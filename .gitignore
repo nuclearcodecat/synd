@@ -3,3 +3,4 @@ synd/target
 synctl/target
 synd/Cargo.lock
 synctl/Cargo.lock
+synd-common/target

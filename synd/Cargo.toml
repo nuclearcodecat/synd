@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+atom_syndication = "0.12.7"
+minreq = { version = "2.14.1", features = ["https"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 uuid = { version = "1.23.1", features = ["serde", "v4"] }
+synd-common = { path = "../synd-common" }
+libc = "0.2.186"
