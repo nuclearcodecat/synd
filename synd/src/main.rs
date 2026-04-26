@@ -2,7 +2,9 @@ use crate::synd::Synd;
 
 mod synd;
 
-fn main() {
-	let synd = Synd::new();
-	println!("Hello, world!");
+fn main() -> anyhow::Result<()> {
+	let mut synd = Synd::new()?;
+	loop {
+		synd.work()?
+	}
 }
