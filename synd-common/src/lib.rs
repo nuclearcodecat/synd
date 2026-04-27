@@ -1,41 +1,60 @@
-use std::fmt::Display;
-
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
-pub enum ParseError {
-	InvalidNamespace,
-	InvalidCommand,
-	MissingArgument(&'static str),
-	General,
+#[derive(Serialize, Deserialize, Debug)]
+pub enum SyndError {
+	InvalidParameter,
 	Uuid(String),
 }
 
-impl From<uuid::Error> for ParseError {
+impl From<uuid::Error> for SyndError {
 	fn from(er: uuid::Error) -> Self {
-		ParseError::Uuid(er.to_string())
+		SyndError::Uuid(er.to_string())
 	}
 }
 
-// from rssd, might be useless
-impl Display for ParseError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			ParseError::MissingArgument(arg) => write!(f, "missing {arg} argument"),
-			ParseError::InvalidCommand => write!(f, "invalid command"),
-			ParseError::InvalidNamespace => write!(f, "invalid namespace"),
-			ParseError::General => write!(f, "message mangled"),
-			ParseError::Uuid(er) => write!(f, "{er}"),
-		}
+#[derive(Deserialize, Serialize)]
+pub enum SocketResponseStatus {
+	Good,
+	Error,
+}
+
+#[derive(Serialize)]
+pub struct SocketResponse<T: Serialize> {
+	pub status: SocketResponseStatus,
+	pub inner: Option<T>,
+}
+
+pub trait ToSerializedResponse {
+	fn to_ser_response(self) -> serde_json::Result<String>;
+}
+
+impl ToSerializedResponse for serde_json::Error {
+	fn to_ser_response(self) -> serde_json::Result<String> {
+		let res = SocketResponse {
+			status: SocketResponseStatus::Error,
+			inner: Some(self.to_string()),
+		};
+		serde_json::to_string(&res)
 	}
 }
 
-impl ParseError {
-	pub fn to_socket_response(&self) -> serde_json::Result<String> {
+impl ToSerializedResponse for SyndError {
+	fn to_ser_response(self) -> serde_json::Result<String> {
+		let res = SocketResponse {
+			status: SocketResponseStatus::Error,
+			inner: Some(format!("{self:#?}")),
+		};
+		serde_json::to_string(&res)
+	}
+}
+
+impl<T: Serialize> ToSerializedResponse for SocketResponse<T> {
+	fn to_ser_response(self) -> serde_json::Result<String> {
 		serde_json::to_string(&self)
 	}
 }
 
+// (namespaces)
 #[derive(Deserialize)]
 pub enum SocketInput {
 	FollowDb(FollowDbCommand),
@@ -45,7 +64,7 @@ pub enum SocketInput {
 
 #[derive(Deserialize)]
 pub enum FollowDbCommand {
-	Insert { name: String, url: String },
+	Insert { name: Option<String>, url: String },
 	Remove { uuid: uuid::Uuid },
 }
 

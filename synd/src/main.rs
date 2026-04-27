@@ -5,6 +5,7 @@ use std::{
 
 use crate::synd::Synd;
 
+mod db;
 mod synd;
 
 static KILLED: AtomicBool = AtomicBool::new(false);

@@ -11,11 +11,16 @@ use std::{
 	sync::LazyLock,
 	time::{Duration, Instant},
 };
-use synd_common::{FeedsCommand, FollowDbCommand, MainLoopCommand, ParseError, SocketInput};
+use synd_common::{
+	FeedsCommand, FollowDbCommand, MainLoopCommand, SocketInput, SocketResponse,
+	SocketResponseStatus, SyndError, ToSerializedResponse,
+};
 
-static HOMEDIR: LazyLock<PathBuf> = LazyLock::new(|| env::home_dir().expect("$HOME not set"));
+use crate::db::Db;
 
-static CONFIGDIR: LazyLock<PathBuf> = LazyLock::new(|| match env::var("XDG_CONFIG_DIR") {
+pub static HOMEDIR: LazyLock<PathBuf> = LazyLock::new(|| env::home_dir().expect("$HOME not set"));
+
+pub static CONFIGDIR: LazyLock<PathBuf> = LazyLock::new(|| match env::var("XDG_CONFIG_DIR") {
 	Ok(d) => PathBuf::from(d),
 	Err(_) => {
 		let homedir = HOMEDIR.clone();
@@ -29,8 +34,8 @@ pub struct Synd {
 	sockpath: PathBuf,
 	sock: UnixListener,
 	last_fetch: Option<Instant>,
-	followed: Vec<FollowedEntry>,
-	read: Vec<ReadEntry>,
+	followed: Db<FollowedEntry>,
+	read: Db<ReadEntry>,
 }
 
 impl Drop for Synd {
@@ -105,15 +110,14 @@ impl Config {
 		}
 	}
 
-	fn parse() -> Self {
+	fn parse() -> anyhow::Result<Self> {
 		let mut new = Self::default();
 		let configpath = CONFIGDIR.clone().join("config");
 		let mut contents = String::new();
 		match File::open(&configpath) {
 			Ok(mut file) => {
-				// SHOULD BE A RESULT:w
-				//=
-				file.read_to_string(&mut contents);
+				file.read_to_string(&mut contents)
+					.with_context(|| "while reading config")?;
 				let lines = contents.lines();
 				let valid = lines
 					.filter_map(|line| {
@@ -132,12 +136,12 @@ impl Config {
 				eprintln!("config file missing or unavailable ({er}). using defaults.");
 			}
 		}
-		new
+		Ok(new)
 	}
 }
 
 enum ParseEffect {
-	InsertFollowee(FeedName, FeedUrl),
+	InsertFollowee { name: Option<String>, url: String },
 	RemoveFollowee(uuid::Uuid),
 	GetFeed(uuid::Uuid),
 	ListFeeds,
@@ -145,49 +149,47 @@ enum ParseEffect {
 	ForceFetch,
 }
 
-struct FeedName(String);
-struct FeedUrl(String);
-
-fn get_followed() -> anyhow::Result<Vec<FollowedEntry>> {
-	let mut oo = OpenOptions::new();
-	oo.write(true).read(true).create(true);
-	let fp = CONFIGDIR.clone().join("followed.db");
-	println!("{fp:?}");
-	let mut file = oo
-		.open(fp)
-		.with_context(|| "while opening followed.db file")?;
-	let new: Vec<FollowedEntry> = serde_json::from_reader(file)?;
-	println!("followed: {new:#?}");
-	Ok(new)
-}
-
-fn get_sockpath() -> anyhow::Result<PathBuf> {
-	let rtdir = PathBuf::from(
-		std::env::var("XDG_RUNTIME_DIR").with_context(|| "while checking runtime dir envvar")?,
-	);
-	let sockdir = rtdir.join("synd");
-	fs::create_dir_all(&sockdir).with_context(|| "while creating sock dir")?;
-
-	Ok(sockdir.join("con.sock"))
-}
-
-fn get_sock(sockpath: &PathBuf) -> anyhow::Result<UnixListener> {
-	let sock = UnixListener::bind(sockpath).with_context(|| "while binding to socket")?;
-	sock.set_nonblocking(true)
-		.with_context(|| "while setting nonblocking socket")?;
-
-	Ok(sock)
-}
-
 impl Synd {
+	fn get_followed() -> anyhow::Result<Db<FollowedEntry>> {
+		let new = Db::new("followed.db")?;
+		println!("followed: {new:#?}");
+		Ok(new)
+	}
+
+	fn get_read() -> anyhow::Result<Db<ReadEntry>> {
+		let new = Db::new("read.db")?;
+		println!("read: {new:#?}");
+		Ok(new)
+	}
+
+	fn get_sockpath() -> anyhow::Result<PathBuf> {
+		let rtdir = PathBuf::from(
+			std::env::var("XDG_RUNTIME_DIR")
+				.with_context(|| "while checking runtime dir envvar ($XDG_RUNTIME_DIR not set?)")?,
+		);
+		let sockdir = rtdir.join("synd");
+		fs::create_dir_all(&sockdir).with_context(|| "while creating sock dir")?;
+
+		Ok(sockdir.join("con.sock"))
+	}
+
+	fn get_sock(sockpath: &PathBuf) -> anyhow::Result<UnixListener> {
+		let sock = UnixListener::bind(sockpath).with_context(|| "while binding to socket")?;
+		sock.set_nonblocking(true)
+			.with_context(|| "while setting nonblocking socket")?;
+
+		Ok(sock)
+	}
+
 	pub fn new() -> anyhow::Result<Self> {
-		let sockpath = get_sockpath().with_context(|| "while getting sock path")?;
-		let mut new = Self {
-			config: Config::parse(),
+		let sockpath = Self::get_sockpath().with_context(|| "while getting sock path")?;
+		println!("passed1");
+		let new = Self {
+			config: Config::parse()?,
 			last_fetch: None,
-			followed: get_followed()?,
-			read: Vec::new(),
-			sock: get_sock(&sockpath)?,
+			followed: Self::get_followed()?,
+			read: Self::get_read()?,
+			sock: Self::get_sock(&sockpath)?,
 			sockpath,
 		};
 		println!("{new:#?}");
@@ -207,33 +209,96 @@ impl Synd {
 					let recv = String::leak(recv);
 					match parse_input(recv) {
 						Ok(eft) => match eft {
-							ParseEffect::InsertFollowee(feed_name, feed_url) => {
-								todo!()
+							ParseEffect::InsertFollowee { name, url } => {
+								let entry = FollowedEntry {
+									uuid: uuid::Uuid::new_v4(),
+									name,
+									url,
+								};
+								self.followed.inner.push(entry);
+								self.followed.write_to_file()?;
 							}
-							ParseEffect::RemoveFollowee(feed_name) => {
-								todo!()
+							ParseEffect::RemoveFollowee(uuid) => {
+								let ix = self
+									.followed
+									.inner
+									.iter()
+									.enumerate()
+									.find(|(_, e)| e.uuid == uuid)
+									.map(|(ix, _)| ix);
+								if let Some(ix) = ix {
+									self.followed.inner.swap_remove(ix);
+									self.followed.write_to_file()?;
+								} else {
+									stream.write_all(
+										SyndError::InvalidParameter.to_ser_response()?.as_bytes(),
+									)?;
+								}
 							}
-							ParseEffect::GetFeed(feed) => {
-								todo!()
+							ParseEffect::GetFeed(uuid) => {
+								// todo DRY this
+								//
+								//
+								let ix = self
+									.followed
+									.inner
+									.iter()
+									.enumerate()
+									.find(|(_, e)| e.uuid == uuid)
+									.map(|(ix, _)| ix);
+								if let Some(ix) = ix {
+									stream.write_all(
+										SocketResponse {
+											status: SocketResponseStatus::Good,
+											inner: Some(&self.followed.inner[ix]),
+										}
+										.to_ser_response()?
+										.as_bytes(),
+									)?;
+								} else {
+									stream.write_all(
+										SyndError::InvalidParameter.to_ser_response()?.as_bytes(),
+									)?;
+								}
 							}
 							ParseEffect::ListFeeds => {
-								let x = serde_json::to_string(&self.followed)?;
-								println!("WRITING\n\n\n\n\n{x}");
-								stream.write_all(x.as_bytes())?;
+								let x = serde_json::to_string(&self.followed.inner)?;
+								// println!("WRITING\n\n\n\n\n{x}");
+								stream.write_all(
+									SocketResponse {
+										status: SocketResponseStatus::Good,
+										inner: Some(&x),
+									}
+									.to_ser_response()?
+									.as_bytes(),
+								)?;
 							}
 							ParseEffect::TimeToFetch => {
 								// this is probably fragile
 								let duration =
 									self.config.fetch_interval - self.last_fetch.unwrap().elapsed();
-								let str = duration.as_secs().to_string();
-								stream.write_all(str.as_bytes())?;
+								stream.write_all(
+									SocketResponse {
+										status: SocketResponseStatus::Good,
+										inner: Some(&duration.as_secs()),
+									}
+									.to_ser_response()?
+									.as_bytes(),
+								)?;
 							}
 							ParseEffect::ForceFetch => {
 								self.last_fetch = None;
+								stream.write_all(
+									SocketResponse::<()> {
+										status: SocketResponseStatus::Good,
+										inner: None,
+									}
+									.to_ser_response()?
+									.as_bytes(),
+								)?;
 							}
 						},
-						Err(er) => stream
-							.write_all(er.to_socket_response().with_context(|| "x")?.as_bytes())?,
+						Err(er) => stream.write_all(er.to_ser_response()?.as_bytes())?,
 					};
 					stream.flush()?;
 				}
@@ -255,7 +320,7 @@ impl Synd {
 			return Ok(());
 		}
 		self.last_fetch = Some(Instant::now());
-		for followed in &self.followed {
+		for followed in &self.followed.inner {
 			let res = match minreq::get(&followed.url).send() {
 				Ok(r) => r,
 				Err(er) => {
@@ -282,19 +347,17 @@ impl Synd {
 	}
 
 	pub fn work(&mut self) -> anyhow::Result<()> {
-		self.handle_streams();
-		self.fetch_feeds();
+		self.handle_streams()?;
+		self.fetch_feeds()?;
 		Ok(())
 	}
 }
 
-fn parse_input(recv: &str) -> Result<ParseEffect, ParseError> {
-	let input: SocketInput = serde_json::from_str(recv).map_err(|_| ParseError::General)?;
+fn parse_input(recv: &str) -> serde_json::Result<ParseEffect> {
+	let input: SocketInput = serde_json::from_str(recv)?;
 	Ok(match input {
 		SocketInput::FollowDb(cmd) => match cmd {
-			FollowDbCommand::Insert { name, url } => {
-				ParseEffect::InsertFollowee(FeedName(name), FeedUrl(url))
-			}
+			FollowDbCommand::Insert { name, url } => ParseEffect::InsertFollowee { name, url },
 			FollowDbCommand::Remove { uuid } => ParseEffect::RemoveFollowee(uuid),
 		},
 		SocketInput::Feeds(cmd) => match cmd {
