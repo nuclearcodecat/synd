@@ -7,6 +7,7 @@ use crate::synd::Synd;
 
 mod db;
 mod synd;
+mod systime;
 
 static KILLED: AtomicBool = AtomicBool::new(false);
 

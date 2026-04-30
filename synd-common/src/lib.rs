@@ -56,7 +56,7 @@ impl<T: Serialize> ToSerializedResponse for SocketResponse<T> {
 
 // (namespaces)
 #[derive(Deserialize)]
-pub enum SocketInput {
+pub enum SocketQuery {
 	FollowDb(FollowDbCommand),
 	Feeds(FeedsCommand),
 	MainLoop(MainLoopCommand),
