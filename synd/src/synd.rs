@@ -9,7 +9,7 @@ use std::{
 	os::unix::net::UnixListener,
 	path::PathBuf,
 	sync::LazyLock,
-	time::{Duration, Instant, SystemTime},
+	time::{Duration, Instant},
 };
 use synd_common::{
 	FeedsCommand, FollowDbCommand, MainLoopCommand, SocketQuery, SocketResponse,
@@ -41,9 +41,9 @@ pub struct Synd {
 impl Drop for Synd {
 	fn drop(&mut self) {
 		if let Err(er) = fs::remove_file(&self.sockpath) {
-			eprintln!("failed to remove socket file: {er:?}");
+			eprintln!("=er= failed to remove socket file: {er:?} =er=");
 		} else {
-			println!("removed con.sock");
+			println!("==== removed con.sock ====");
 		};
 	}
 }
@@ -73,11 +73,21 @@ struct ReadEntry {
 	// added_at: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct SendEntry {
+	ident: ReadIdent,
+	title: String,
+	url: String,
+	summary: String,
+}
+
 #[derive(Debug)]
 struct Config {
 	fetch_interval: Duration,
 	action: Option<PathBuf>,
 	removal_threshold: Option<Duration>,
+	max_summary_length: usize,
+	max_inferred_summary_length: usize,
 }
 
 impl Default for Config {
@@ -85,7 +95,9 @@ impl Default for Config {
 		Self {
 			fetch_interval: Duration::from_mins(10),
 			action: None,
-			removal_threshold: None,
+			removal_threshold: Some(Duration::from_days(90)),
+			max_summary_length: 240,
+			max_inferred_summary_length: 240,
 		}
 	}
 }
@@ -98,7 +110,7 @@ impl Config {
 					Ok(x) => x,
 					Err(er) => {
 						eprintln!(
-							"parsing error: {er}, invalid assignment \"{ass}\" for \"{var}\", using default value"
+							"=er= parsing error: {er}, invalid assignment \"{ass}\" for \"{var}\", using default value =er="
 						);
 						return;
 					}
@@ -106,7 +118,8 @@ impl Config {
 				self.fetch_interval = Duration::from_secs(parsed);
 			}
 			"action" => {
-				// expect to be in configdir for now
+				// todo | expect to be in configdir for now
+				// todo maybe check whether file exists and is executable
 				let filetail = ass;
 				let mut configdir = CONFIGDIR.clone();
 				configdir = configdir.join(filetail);
@@ -114,7 +127,6 @@ impl Config {
 			}
 			"removal threshold" => {
 				// 90 days
-				const DEFAULT: u64 = 90 * 60 * 60 * 24;
 				let thr = ass.as_bytes();
 				let kar = thr[thr.len() - 1] as char;
 				let is_in_seconds = kar == 's';
@@ -133,9 +145,9 @@ impl Config {
 					}
 					Err(er) => {
 						eprintln!(
-							"parsing error: {er}, invalid numeric value in removal threshold, using default value"
+							"=er= parsing error: {er}, invalid numeric value in {var}, using default value =er="
 						);
-						DEFAULT
+						return;
 					}
 				};
 
@@ -145,8 +157,28 @@ impl Config {
 					Some(Duration::from_secs(in_seconds))
 				};
 			}
+			"max inferred summary length" => match ass.parse::<usize>() {
+				Ok(len) => {
+					self.max_inferred_summary_length = len;
+				}
+				Err(er) => {
+					eprintln!(
+						"=er= parsing error: {er}, invalid numeric value in {var}, using default value =er="
+					);
+				}
+			},
+			"max summary length" => match ass.parse::<usize>() {
+				Ok(len) => {
+					self.max_summary_length = len;
+				}
+				Err(er) => {
+					eprintln!(
+						"=er= parsing error: {er}, invalid numeric value in {var}, using default value =er="
+					);
+				}
+			},
 			_ => {
-				eprintln!("invalid config variable \"{var}\"");
+				eprintln!("=er= invalid config variable \"{var}\" =er=");
 			}
 		}
 	}
@@ -173,7 +205,7 @@ impl Config {
 				}
 			}
 			Err(er) => {
-				eprintln!("config file missing or unavailable ({er}). using defaults.");
+				eprintln!("=er= config file missing or unavailable ({er}). using defaults. =er=");
 			}
 		}
 		Ok(new)
@@ -183,20 +215,20 @@ impl Config {
 impl Synd {
 	fn get_followed() -> anyhow::Result<Db<FollowedEntry>> {
 		let new = Db::new("followed.db")?;
-		println!("followed: {new:#?}");
+		// println!("followed: {new:#?}");
 		Ok(new)
 	}
 
 	fn get_read() -> anyhow::Result<Db<ReadEntry>> {
-		let to_ser = ReadEntry {
-			follow_id: uuid::Uuid::new_v4(),
-			read_id: ReadIdent::AtomId(uuid::Uuid::new_v4().to_string()),
-			added_at: SysTime(SystemTime::now()),
-		};
-		let x = serde_json::to_string_pretty(&to_ser).unwrap();
-		println!("ser\n{x}");
+		// let to_ser = ReadEntry {
+		// 	follow_id: uuid::Uuid::new_v4(),
+		// 	read_id: ReadIdent::AtomId(uuid::Uuid::new_v4().to_string()),
+		// 	added_at: SysTime(SystemTime::now()),
+		// };
+		// let x = serde_json::to_string_pretty(&to_ser).unwrap();
+		// println!("ser\n{x}");
 		let new = Db::new("read.db")?;
-		println!("read: {new:#?}");
+		// println!("read: {new:#?}");
 		Ok(new)
 	}
 
@@ -221,10 +253,8 @@ impl Synd {
 
 	pub fn new() -> anyhow::Result<Self> {
 		let sockpath = Self::get_sockpath().with_context(|| "while getting sock path")?;
-		let config = Config::parse()?;
-		println!("{config:#?}");
 		let new = Self {
-			config,
+			config: Config::parse().with_context(|| "while getting config")?,
 			last_fetch: None,
 			followed: Self::get_followed()?,
 			read: Self::get_read()?,
@@ -245,8 +275,7 @@ impl Synd {
 					let mut recv = String::new();
 					reader.read_line(&mut recv)?;
 					recv.truncate(recv.len().saturating_sub(1));
-					let recv = String::leak(recv);
-					match serde_json::from_str::<SocketQuery>(recv) {
+					match serde_json::from_str::<SocketQuery>(&recv) {
 						Ok(eft) => match eft {
 							SocketQuery::FollowDb(fdc) => match fdc {
 								FollowDbCommand::Insert { name, url } => {
@@ -362,14 +391,19 @@ impl Synd {
 		Ok(())
 	}
 
-	fn fetch_feeds(&mut self) -> anyhow::Result<()> {
+	fn check_feeds(&mut self) -> anyhow::Result<()> {
 		if let Some(last_fetch) = self.last_fetch
 			&& last_fetch.elapsed() < self.config.fetch_interval
 		{
 			return Ok(());
 		}
+		println!("==== fetching feeds ====");
 		self.last_fetch = Some(Instant::now());
+
+		let mut new = false;
+
 		for followed in &self.followed.inner {
+			println!("==== iter ====");
 			let res = match minreq::get(&followed.url).send() {
 				Ok(r) => r,
 				Err(er) => {
@@ -388,22 +422,103 @@ impl Synd {
 					continue;
 				}
 			};
-			let atom = atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed)));
-			println!("{atom:#?}");
+			#[allow(unused)]
+			#[allow(clippy::all)]
+			let items = if let Ok(feed) =
+				atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed)))
+			{
+				let entries = feed
+					.entries()
+					.iter()
+					.filter_map(|e| {
+						let ident = ReadIdent::AtomId(e.id().to_owned());
+						let title = e.title.to_string();
+						match e.links.first().map(|l| l.href().to_owned()) {
+							Some(url) => Some(SendEntry {
+								ident,
+								title,
+								url,
+								// todo consider missing summary
+								summary: e
+									.summary()
+									.map(|s| s.to_string().clone())
+									.unwrap_or_default(),
+							}),
+							None => {
+								// link is required according to wikipedia
+								eprintln!(
+									"=er= link missing in entry titled \"{title}\" (from feed under \"{}\"), skipping =er=",
+									followed.url
+								);
+								None
+							}
+						}
+					})
+					.collect::<Vec<_>>();
+				println!("=============== ATOM ENTRIES ===============\n\n\n{entries:#?}");
+			} else if let Ok(feed) = rss::Channel::read_from(BufReader::new(Cursor::new(feed))) {
+				let entries = feed
+					.items()
+					.iter()
+					.filter_map(|i| {
+						let ident = if let Some(guid) = i.guid() {
+							ReadIdent::RssGuid(guid.value().to_owned())
+						} else if let Some(link) = i.link() {
+							ReadIdent::RssLink(link.to_owned())
+						} else {
+							eprintln!(
+								"=er= unidentifiable item in rss feed under {} =er=",
+								followed.url
+							);
+							return None;
+						};
+						// title is defined as mandatory by wikipedia but i'll include a sentinel
+						let title = i.title().unwrap_or("[no title]").to_owned();
+						// link is specified as mandatory by wikipedia
+						let url = match i.link() {
+							Some(u) => u.to_owned(),
+							None => return None,
+						};
+						// also defined as mandatory
+						let summary = if let Some(desc) = i.description() {
+							if desc.len() > self.config.max_summary_length {
+								desc[..self.config.max_summary_length].to_owned()
+							} else {
+								desc.to_owned()
+							}
+						} else if let Some(cont) = i.content() {
+							if cont.len() > self.config.max_inferred_summary_length {
+								let mut string =
+									cont[..self.config.max_inferred_summary_length].to_owned();
+								string.push_str("...");
+								string
+							} else {
+								cont.to_owned()
+							}
+						} else {
+							String::from("[no description]")
+						};
+						Some(SendEntry {
+							ident,
+							title,
+							url,
+							summary,
+						})
+					})
+					.collect::<Vec<_>>();
+				println!("=============== RSS ENTRIES ===============\n\n\n{entries:#?}");
+			} else {
+				eprintln!("=er= invalid feed under {}", followed.url);
+			};
+			// println!("{atom:#?}");
 		}
-		println!("==== fetching feeds ====");
-		Ok(())
-	}
-
-	fn alarm(&mut self) -> anyhow::Result<()> {
-		println!("{:#?}", self.read);
-		Ok(())
+		Err(anyhow::Error::msg("intentional"))
+		// Ok(())
 	}
 
 	pub fn work(&mut self) -> anyhow::Result<()> {
 		self.handle_streams()?;
-		self.fetch_feeds()?;
-		self.alarm()?;
+		self.check_feeds()?;
 		Ok(())
 	}
 }

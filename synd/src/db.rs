@@ -1,6 +1,6 @@
 use std::{
 	fs::{File, OpenOptions},
-	io::Write,
+	io::{Seek, Write},
 	sync::LazyLock,
 };
 
@@ -37,6 +37,10 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 	pub fn write_to_file(&mut self) -> anyhow::Result<()> {
 		let ser =
 			serde_json::to_string(&self.inner).with_context(|| "while serializing db file")?;
+		self.file.rewind().with_context(|| "while rewinding Seek")?;
+		self.file
+			.set_len(0)
+			.with_context(|| "while truncating file")?;
 		self.file
 			.write(ser.as_bytes())
 			.with_context(|| "while writing to db file")?;

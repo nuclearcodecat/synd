@@ -1,3 +1,5 @@
+#![feature(duration_constructors)]
+
 use std::{
 	sync::atomic::{AtomicBool, Ordering},
 	time::Duration,
