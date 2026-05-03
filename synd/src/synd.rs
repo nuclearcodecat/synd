@@ -6,15 +6,16 @@ use std::{
 	env,
 	fs::{self, File},
 	io::{BufRead, BufReader, Cursor, Read, Write},
-	os::unix::net::UnixListener,
+	os::unix::net::{UnixListener, UnixStream},
 	path::PathBuf,
 	sync::LazyLock,
-	time::{Duration, Instant},
+	time::{Duration, Instant, SystemTime},
 };
 use synd_common::{
 	FeedsCommand, FollowDbCommand, MainLoopCommand, SocketQuery, SocketResponse,
-	SocketResponseStatus, SyndError, ToSerializedResponse,
+	SocketResponseStatus, SyndError,
 };
+type SockStatus = SocketResponseStatus;
 
 use crate::{db::Db, systime::SysTime};
 
@@ -55,6 +56,7 @@ struct FollowedEntry {
 	uuid: FollowId,
 	name: Option<String>,
 	url: String,
+	inserted_at: SysTime,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -266,15 +268,41 @@ impl Synd {
 		Ok(new)
 	}
 
+	fn _write_to_stream_inner<T: Serialize>(
+		stream: &mut UnixStream,
+		status: SockStatus,
+		inner: Option<T>,
+	) -> anyhow::Result<()> {
+		stream
+			.write_all(
+				serde_json::to_string(&SocketResponse { status, inner })
+					.with_context(|| "while serializing response")?
+					.as_bytes(),
+			)
+			.with_context(|| "while writing response to sock")?;
+		Ok(())
+	}
+
+	fn write_to_stream_msg<T: Serialize>(
+		stream: &mut UnixStream,
+		status: SockStatus,
+		inner: T,
+	) -> anyhow::Result<()> {
+		Self::_write_to_stream_inner(stream, status, Some(inner))
+	}
+
+	fn write_to_stream(stream: &mut UnixStream, status: SockStatus) -> anyhow::Result<()> {
+		Self::write_to_stream_msg(stream, status, None::<()>)
+	}
+
 	fn handle_streams(&mut self) -> anyhow::Result<()> {
 		for stream in self.sock.incoming() {
 			match stream {
 				Ok(mut stream) => {
-					let nstream = stream.try_clone()?;
+					let nstream = stream.try_clone().with_context(|| "while cloning stream")?;
 					let mut reader = BufReader::new(nstream);
 					let mut recv = String::new();
 					reader.read_line(&mut recv)?;
-					recv.truncate(recv.len().saturating_sub(1));
 					match serde_json::from_str::<SocketQuery>(&recv) {
 						Ok(eft) => match eft {
 							SocketQuery::FollowDb(fdc) => match fdc {
@@ -283,32 +311,34 @@ impl Synd {
 										uuid: uuid::Uuid::new_v4(),
 										name,
 										url,
+										inserted_at: SysTime(SystemTime::now()),
 									};
 									self.followed.inner.push(entry);
 									self.followed.write_to_file()?;
+									Self::write_to_stream(&mut stream, SockStatus::Good)?;
 								}
-								FollowDbCommand::Remove { uuid } => {
+								FollowDbCommand::Remove { id } => {
 									let ix = self
 										.followed
 										.inner
 										.iter()
 										.enumerate()
-										.find(|(_, e)| e.uuid == uuid)
+										.find(|(_, e)| e.uuid == id)
 										.map(|(ix, _)| ix);
 									if let Some(ix) = ix {
 										self.followed.inner.swap_remove(ix);
 										self.followed.write_to_file()?;
 									} else {
-										stream.write_all(
-											SyndError::InvalidParameter
-												.to_ser_response()?
-												.as_bytes(),
+										Self::write_to_stream_msg(
+											&mut stream,
+											SockStatus::Bad,
+											SyndError::InvalidParameter,
 										)?;
 									}
 								}
 							},
 							SocketQuery::Feeds(fc) => match fc {
-								FeedsCommand::Get { uuid } => {
+								FeedsCommand::Get { id } => {
 									// todo DRY this
 									//
 									//
@@ -317,36 +347,25 @@ impl Synd {
 										.inner
 										.iter()
 										.enumerate()
-										.find(|(_, e)| e.uuid == uuid)
+										.find(|(_, e)| e.uuid == id)
 										.map(|(ix, _)| ix);
 									if let Some(ix) = ix {
-										stream.write_all(
-											SocketResponse {
-												status: SocketResponseStatus::Good,
-												inner: Some(&self.followed.inner[ix]),
-											}
-											.to_ser_response()?
-											.as_bytes(),
+										Self::write_to_stream_msg(
+											&mut stream,
+											SockStatus::Good,
+											&self.followed.inner[ix],
 										)?;
 									} else {
-										stream.write_all(
-											SyndError::InvalidParameter
-												.to_ser_response()?
-												.as_bytes(),
+										Self::write_to_stream_msg(
+											&mut stream,
+											SocketResponseStatus::Bad,
+											SyndError::InvalidParameter,
 										)?;
 									}
 								}
 								FeedsCommand::List => {
 									let x = serde_json::to_string(&self.followed.inner)?;
-									// println!("WRITING\n\n\n\n\n{x}");
-									stream.write_all(
-										SocketResponse {
-											status: SocketResponseStatus::Good,
-											inner: Some(&x),
-										}
-										.to_ser_response()?
-										.as_bytes(),
-									)?;
+									Self::write_to_stream_msg(&mut stream, SockStatus::Good, &x)?;
 								}
 							},
 							SocketQuery::MainLoop(mlc) => match mlc {
@@ -354,29 +373,21 @@ impl Synd {
 									// this is probably fragile
 									let duration = self.config.fetch_interval
 										- self.last_fetch.unwrap().elapsed();
-									stream.write_all(
-										SocketResponse {
-											status: SocketResponseStatus::Good,
-											inner: Some(&duration.as_secs()),
-										}
-										.to_ser_response()?
-										.as_bytes(),
+									Self::write_to_stream_msg(
+										&mut stream,
+										SockStatus::Good,
+										duration.as_secs(),
 									)?;
 								}
 								MainLoopCommand::ForceFetch => {
 									self.last_fetch = None;
-									stream.write_all(
-										SocketResponse::<()> {
-											status: SocketResponseStatus::Good,
-											inner: None,
-										}
-										.to_ser_response()?
-										.as_bytes(),
-									)?;
+									Self::write_to_stream(&mut stream, SockStatus::Good)?;
 								}
 							},
 						},
-						Err(er) => stream.write_all(er.to_ser_response()?.as_bytes())?,
+						Err(er) => {
+							Self::write_to_stream_msg(&mut stream, SockStatus::Bad, er.to_string())?
+						}
 					};
 					stream.flush()?;
 				}
@@ -512,8 +523,8 @@ impl Synd {
 			};
 			// println!("{atom:#?}");
 		}
-		Err(anyhow::Error::msg("intentional"))
-		// Ok(())
+		// Err(anyhow::Error::msg("intentional"))
+		Ok(())
 	}
 
 	pub fn work(&mut self) -> anyhow::Result<()> {

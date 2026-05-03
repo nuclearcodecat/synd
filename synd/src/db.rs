@@ -28,10 +28,14 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 		let file = OPENOPT
 			.open(fp)
 			.with_context(|| "while opening followed.db file")?;
-		Ok(Self {
-			inner: serde_json::from_reader(file.try_clone()?)?,
-			file,
-		})
+		let inner = match serde_json::from_reader(file.try_clone()?) {
+			Ok(i) => i,
+			Err(er) => {
+				println!("=wa= invalid or nonexistent {fname}, creating new. ({er}) =wa=");
+				Vec::new()
+			}
+		};
+		Ok(Self { inner, file })
 	}
 
 	pub fn write_to_file(&mut self) -> anyhow::Result<()> {

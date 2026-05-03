@@ -15,7 +15,7 @@ impl From<uuid::Error> for SyndError {
 #[derive(Deserialize, Serialize)]
 pub enum SocketResponseStatus {
 	Good,
-	Error,
+	Bad,
 }
 
 #[derive(Serialize)]
@@ -31,7 +31,7 @@ pub trait ToSerializedResponse {
 impl ToSerializedResponse for serde_json::Error {
 	fn to_ser_response(self) -> serde_json::Result<String> {
 		let res = SocketResponse {
-			status: SocketResponseStatus::Error,
+			status: SocketResponseStatus::Bad,
 			inner: Some(self.to_string()),
 		};
 		serde_json::to_string(&res)
@@ -41,7 +41,7 @@ impl ToSerializedResponse for serde_json::Error {
 impl ToSerializedResponse for SyndError {
 	fn to_ser_response(self) -> serde_json::Result<String> {
 		let res = SocketResponse {
-			status: SocketResponseStatus::Error,
+			status: SocketResponseStatus::Bad,
 			inner: Some(format!("{self:#?}")),
 		};
 		serde_json::to_string(&res)
@@ -55,27 +55,33 @@ impl<T: Serialize> ToSerializedResponse for SocketResponse<T> {
 }
 
 // (namespaces)
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum SocketQuery {
 	FollowDb(FollowDbCommand),
 	Feeds(FeedsCommand),
 	MainLoop(MainLoopCommand),
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum FollowDbCommand {
 	Insert { name: Option<String>, url: String },
-	Remove { uuid: uuid::Uuid },
+	Remove { id: uuid::Uuid },
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum FeedsCommand {
-	Get { uuid: uuid::Uuid },
+	Get { id: uuid::Uuid },
 	List,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum MainLoopCommand {
 	GetTimeUntilNextFetch,
 	ForceFetch,
+}
+
+impl ToSerializedResponse for SocketQuery {
+	fn to_ser_response(self) -> serde_json::Result<String> {
+		serde_json::to_string(&self)
+	}
 }
