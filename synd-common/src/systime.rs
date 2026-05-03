@@ -1,13 +1,15 @@
 // MODIFIED SERIALIZER FOR SYSTEMTIME FROM SERDE'S CODE; WITHOUT SUBNANOS
 
 use std::{
+	num::ParseIntError,
 	ops::Deref,
+	str::FromStr,
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::Error as _};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SysTime(pub SystemTime);
 
 impl Deref for SysTime {
@@ -42,5 +44,14 @@ impl<'de> Deserialize<'de> for SysTime {
 			.checked_add(Duration::from_secs(secs))
 			.ok_or_else(|| D::Error::custom("overflow deserializing SystemTime"))
 			.map(SysTime)
+	}
+}
+
+impl FromStr for SysTime {
+	type Err = ParseIntError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let parsed = s.parse::<u64>()?;
+		Ok(SysTime(UNIX_EPOCH + Duration::from_secs(parsed)))
 	}
 }

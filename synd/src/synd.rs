@@ -12,12 +12,11 @@ use std::{
 	time::{Duration, Instant, SystemTime},
 };
 use synd_common::{
-	FeedsCommand, FollowDbCommand, MainLoopCommand, SocketQuery, SocketResponse,
-	SocketResponseStatus, SyndError,
+	FeedsCommand, FollowId, FollowedEntry, MainLoopCommand, Response, SocketQuery, SyndError,
+	systime::SysTime,
 };
-type SockStatus = SocketResponseStatus;
 
-use crate::{db::Db, systime::SysTime};
+use crate::db::Db;
 
 pub static HOMEDIR: LazyLock<PathBuf> = LazyLock::new(|| env::home_dir().expect("$HOME not set"));
 
@@ -47,16 +46,6 @@ impl Drop for Synd {
 			println!("==== removed con.sock ====");
 		};
 	}
-}
-
-type FollowId = uuid::Uuid;
-
-#[derive(Serialize, Deserialize, Debug)]
-struct FollowedEntry {
-	uuid: FollowId,
-	name: Option<String>,
-	url: String,
-	inserted_at: SysTime,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -217,7 +206,6 @@ impl Config {
 impl Synd {
 	fn get_followed() -> anyhow::Result<Db<FollowedEntry>> {
 		let new = Db::new("followed.db")?;
-		// println!("followed: {new:#?}");
 		Ok(new)
 	}
 
@@ -268,31 +256,15 @@ impl Synd {
 		Ok(new)
 	}
 
-	fn _write_to_stream_inner<T: Serialize>(
-		stream: &mut UnixStream,
-		status: SockStatus,
-		inner: Option<T>,
-	) -> anyhow::Result<()> {
+	fn write_to_stream(stream: &mut UnixStream, inner: Response) -> anyhow::Result<()> {
 		stream
 			.write_all(
-				serde_json::to_string(&SocketResponse { status, inner })
+				serde_json::to_string(&inner)
 					.with_context(|| "while serializing response")?
 					.as_bytes(),
 			)
 			.with_context(|| "while writing response to sock")?;
 		Ok(())
-	}
-
-	fn write_to_stream_msg<T: Serialize>(
-		stream: &mut UnixStream,
-		status: SockStatus,
-		inner: T,
-	) -> anyhow::Result<()> {
-		Self::_write_to_stream_inner(stream, status, Some(inner))
-	}
-
-	fn write_to_stream(stream: &mut UnixStream, status: SockStatus) -> anyhow::Result<()> {
-		Self::write_to_stream_msg(stream, status, None::<()>)
 	}
 
 	fn handle_streams(&mut self) -> anyhow::Result<()> {
@@ -305,19 +277,19 @@ impl Synd {
 					reader.read_line(&mut recv)?;
 					match serde_json::from_str::<SocketQuery>(&recv) {
 						Ok(eft) => match eft {
-							SocketQuery::FollowDb(fdc) => match fdc {
-								FollowDbCommand::Insert { name, url } => {
+							SocketQuery::Feeds(fc) => match fc {
+								FeedsCommand::Follow { name, url } => {
 									let entry = FollowedEntry {
 										uuid: uuid::Uuid::new_v4(),
 										name,
 										url,
-										inserted_at: SysTime(SystemTime::now()),
+										read_from: SysTime(SystemTime::now()),
 									};
 									self.followed.inner.push(entry);
 									self.followed.write_to_file()?;
-									Self::write_to_stream(&mut stream, SockStatus::Good)?;
+									Self::write_to_stream(&mut stream, Response::Ack)?;
 								}
-								FollowDbCommand::Remove { id } => {
+								FeedsCommand::Unfollow { id } => {
 									let ix = self
 										.followed
 										.inner
@@ -328,44 +300,51 @@ impl Synd {
 									if let Some(ix) = ix {
 										self.followed.inner.swap_remove(ix);
 										self.followed.write_to_file()?;
+										Self::write_to_stream(&mut stream, Response::Ack)?;
 									} else {
-										Self::write_to_stream_msg(
+										Self::write_to_stream(
 											&mut stream,
-											SockStatus::Bad,
-											SyndError::InvalidParameter,
-										)?;
-									}
-								}
-							},
-							SocketQuery::Feeds(fc) => match fc {
-								FeedsCommand::Get { id } => {
-									// todo DRY this
-									//
-									//
-									let ix = self
-										.followed
-										.inner
-										.iter()
-										.enumerate()
-										.find(|(_, e)| e.uuid == id)
-										.map(|(ix, _)| ix);
-									if let Some(ix) = ix {
-										Self::write_to_stream_msg(
-											&mut stream,
-											SockStatus::Good,
-											&self.followed.inner[ix],
-										)?;
-									} else {
-										Self::write_to_stream_msg(
-											&mut stream,
-											SocketResponseStatus::Bad,
-											SyndError::InvalidParameter,
+											Response::Bad(SyndError::InvalidParameter),
 										)?;
 									}
 								}
 								FeedsCommand::List => {
-									let x = serde_json::to_string(&self.followed.inner)?;
-									Self::write_to_stream_msg(&mut stream, SockStatus::Good, &x)?;
+									Self::write_to_stream(
+										&mut stream,
+										Response::FollowDbList(self.followed.inner.clone()),
+									)?;
+								}
+								FeedsCommand::Update {
+									id_to_update,
+									name,
+									url,
+									read_from,
+								} => {
+									// should probably turn this into a hashmap after reading
+									match self
+										.followed
+										.inner
+										.iter_mut()
+										.find(|f| f.uuid == id_to_update)
+									{
+										Some(e) => {
+											if let Some(name) = name {
+												e.name =
+													if name.is_empty() { None } else { Some(name) };
+											};
+											if let Some(url) = url {
+												e.url = url;
+											};
+											if let Some(read_from) = read_from {
+												e.read_from = read_from;
+											};
+											Self::write_to_stream(&mut stream, Response::Ack)?;
+										}
+										None => Self::write_to_stream(
+											&mut stream,
+											Response::Bad(SyndError::InvalidId),
+										)?,
+									};
 								}
 							},
 							SocketQuery::MainLoop(mlc) => match mlc {
@@ -373,21 +352,21 @@ impl Synd {
 									// this is probably fragile
 									let duration = self.config.fetch_interval
 										- self.last_fetch.unwrap().elapsed();
-									Self::write_to_stream_msg(
+									Self::write_to_stream(
 										&mut stream,
-										SockStatus::Good,
-										duration.as_secs(),
+										Response::TimeUntilFetch(duration.as_secs()),
 									)?;
 								}
 								MainLoopCommand::ForceFetch => {
 									self.last_fetch = None;
-									Self::write_to_stream(&mut stream, SockStatus::Good)?;
+									Self::write_to_stream(&mut stream, Response::Ack)?;
 								}
 							},
 						},
-						Err(er) => {
-							Self::write_to_stream_msg(&mut stream, SockStatus::Bad, er.to_string())?
-						}
+						Err(er) => Self::write_to_stream(
+							&mut stream,
+							Response::Bad(SyndError::Generic(er.to_string())),
+						)?,
 					};
 					stream.flush()?;
 				}

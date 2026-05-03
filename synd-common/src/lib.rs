@@ -1,9 +1,18 @@
 use serde::{Deserialize, Serialize};
 
+pub use serde_json;
+
+use crate::systime::SysTime;
+
+pub mod systime;
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SyndError {
 	InvalidParameter,
 	Uuid(String),
+	Generic(String),
+	InvalidId,
+	InvalidSysTime,
 }
 
 impl From<uuid::Error> for SyndError {
@@ -12,65 +21,47 @@ impl From<uuid::Error> for SyndError {
 	}
 }
 
-#[derive(Deserialize, Serialize)]
-pub enum SocketResponseStatus {
-	Good,
-	Bad,
+pub type FollowId = uuid::Uuid;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Response {
+	Ack,
+	Bad(SyndError),
+	FollowDbEntry(FollowedEntry),
+	FollowDbList(Vec<FollowedEntry>),
+	TimeUntilFetch(u64),
 }
 
-#[derive(Serialize)]
-pub struct SocketResponse<T: Serialize> {
-	pub status: SocketResponseStatus,
-	pub inner: Option<T>,
-}
-
-pub trait ToSerializedResponse {
-	fn to_ser_response(self) -> serde_json::Result<String>;
-}
-
-impl ToSerializedResponse for serde_json::Error {
-	fn to_ser_response(self) -> serde_json::Result<String> {
-		let res = SocketResponse {
-			status: SocketResponseStatus::Bad,
-			inner: Some(self.to_string()),
-		};
-		serde_json::to_string(&res)
-	}
-}
-
-impl ToSerializedResponse for SyndError {
-	fn to_ser_response(self) -> serde_json::Result<String> {
-		let res = SocketResponse {
-			status: SocketResponseStatus::Bad,
-			inner: Some(format!("{self:#?}")),
-		};
-		serde_json::to_string(&res)
-	}
-}
-
-impl<T: Serialize> ToSerializedResponse for SocketResponse<T> {
-	fn to_ser_response(self) -> serde_json::Result<String> {
-		serde_json::to_string(&self)
-	}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FollowedEntry {
+	pub uuid: FollowId,
+	pub name: Option<String>,
+	pub url: String,
+	pub read_from: SysTime,
 }
 
 // (namespaces)
 #[derive(Serialize, Deserialize)]
 pub enum SocketQuery {
-	FollowDb(FollowDbCommand),
 	Feeds(FeedsCommand),
 	MainLoop(MainLoopCommand),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub enum FollowDbCommand {
-	Insert { name: Option<String>, url: String },
-	Remove { id: uuid::Uuid },
-}
-
-#[derive(Serialize, Deserialize, Clone)]
 pub enum FeedsCommand {
-	Get { id: uuid::Uuid },
+	Follow {
+		name: Option<String>,
+		url: String,
+	},
+	Unfollow {
+		id: uuid::Uuid,
+	},
+	Update {
+		id_to_update: uuid::Uuid,
+		name: Option<String>,
+		url: Option<String>,
+		read_from: Option<SysTime>,
+	},
 	List,
 }
 
@@ -78,10 +69,4 @@ pub enum FeedsCommand {
 pub enum MainLoopCommand {
 	GetTimeUntilNextFetch,
 	ForceFetch,
-}
-
-impl ToSerializedResponse for SocketQuery {
-	fn to_ser_response(self) -> serde_json::Result<String> {
-		serde_json::to_string(&self)
-	}
 }
