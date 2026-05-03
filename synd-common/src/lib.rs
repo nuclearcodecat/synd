@@ -26,6 +26,7 @@ pub type FollowId = uuid::Uuid;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
 	Ack,
+	NewId(uuid::Uuid),
 	Bad(SyndError),
 	FollowDbEntry(FollowedEntry),
 	FollowDbList(Vec<FollowedEntry>),
@@ -34,20 +35,20 @@ pub enum Response {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FollowedEntry {
-	pub uuid: FollowId,
+	pub id: FollowId,
 	pub name: Option<String>,
 	pub url: String,
 	pub read_from: SysTime,
 }
 
 // (namespaces)
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum SocketQuery {
 	Feeds(FeedsCommand),
 	MainLoop(MainLoopCommand),
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum FeedsCommand {
 	Follow {
 		name: Option<String>,
@@ -65,7 +66,7 @@ pub enum FeedsCommand {
 	List,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum MainLoopCommand {
 	GetTimeUntilNextFetch,
 	ForceFetch,

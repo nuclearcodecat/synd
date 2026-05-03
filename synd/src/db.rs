@@ -1,7 +1,8 @@
 use std::{
-	fs::{File, OpenOptions},
+	fs::{self, File, OpenOptions},
 	io::{Seek, Write},
 	sync::LazyLock,
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -25,21 +26,44 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 	pub fn new(fname: &'static str) -> anyhow::Result<Self> {
 		let fp = CONFIGDIR.clone().join(fname);
 		// println!("{fp:?}");
-		let file = OPENOPT
-			.open(fp)
+		let mut file = OPENOPT
+			.open(&fp)
 			.with_context(|| "while opening followed.db file")?;
 		let mut make_instantly = false;
 		let inner = match serde_json::from_reader(file.try_clone()?) {
 			Ok(i) => i,
 			Err(er) => {
-				println!("=wa= invalid or nonexistent {fname}, creating new. ({er}) =wa=");
+				println!("=wa= invalid or nonexistent {fname} ({er}) =wa=");
+				if file
+					.stream_len()
+					.with_context(|| "while checking stream len")?
+					> 0
+				{
+					println!("==== saving old contents to .bak file ====");
+					let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+					let mut fp_bak = fp.clone();
+					let mut bak = fp_bak
+						.file_name()
+						.context("while getting file name")?
+						.to_string_lossy()
+						.to_string();
+					bak.push('-');
+					bak.push_str(&now.to_string());
+					fp_bak.set_file_name(&bak);
+					fp_bak.set_extension("bak");
+					fs::copy(&fp, &fp_bak).unwrap_or_else(|_| {
+						panic!("=er= failed to write {fname} backup. exiting immediately =er=")
+					});
+				}
 				make_instantly = true;
 				Vec::new()
 			}
 		};
 		let mut new = Self { inner, file };
 		if make_instantly {
-			new.write_to_file().with_context(|| "while writing to db")?;
+			println!("==== creating new db file ====");
+			new.write_to_file()
+				.with_context(|| "while writing to db file")?;
 		}
 		Ok(new)
 	}

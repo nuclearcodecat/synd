@@ -1,5 +1,10 @@
 // #![allow(unused)]
 
+// todos
+//  - search for todo in %
+//  - store dbs in .local (i think i shall)
+//  - mark whether an Action was already triggered for an entry (true by default for all entries when first following)
+//
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,6 +41,7 @@ pub struct Synd {
 	last_fetch: Option<Instant>,
 	followed: Db<FollowedEntry>,
 	read: Db<ReadEntry>,
+	actioned: Db<ActionedEntry>,
 }
 
 impl Drop for Synd {
@@ -49,7 +55,7 @@ impl Drop for Synd {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-enum ReadIdent {
+enum EntryIdent {
 	// AtomId(uuid::Uuid),
 	AtomId(String),
 	RssGuid(String),
@@ -59,17 +65,23 @@ enum ReadIdent {
 #[derive(Serialize, Deserialize, Debug)]
 struct ReadEntry {
 	follow_id: FollowId,
-	read_id: ReadIdent,
+	ident: EntryIdent,
 	added_at: SysTime,
-	// added_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ActionedEntry {
+	follow_id: FollowId,
+	ident: EntryIdent,
+	added_at: SysTime,
 }
 
 #[derive(Debug, Serialize)]
 struct SendEntry {
-	ident: ReadIdent,
+	ident: EntryIdent,
 	title: String,
 	url: String,
-	summary: String,
+	summary: Option<String>,
 }
 
 #[derive(Debug)]
@@ -248,6 +260,7 @@ impl Synd {
 			last_fetch: None,
 			followed: Self::get_followed()?,
 			read: Self::get_read()?,
+			actioned: Db::new("actioned.db")?,
 			sock: Self::get_sock(&sockpath)?,
 			sockpath,
 		};
@@ -276,93 +289,100 @@ impl Synd {
 					let mut recv = String::new();
 					reader.read_line(&mut recv)?;
 					match serde_json::from_str::<SocketQuery>(&recv) {
-						Ok(eft) => match eft {
-							SocketQuery::Feeds(fc) => match fc {
-								FeedsCommand::Follow { name, url } => {
-									let entry = FollowedEntry {
-										uuid: uuid::Uuid::new_v4(),
-										name,
-										url,
-										read_from: SysTime(SystemTime::now()),
-									};
-									self.followed.inner.push(entry);
-									self.followed.write_to_file()?;
-									Self::write_to_stream(&mut stream, Response::Ack)?;
-								}
-								FeedsCommand::Unfollow { id } => {
-									let ix = self
-										.followed
-										.inner
-										.iter()
-										.enumerate()
-										.find(|(_, e)| e.uuid == id)
-										.map(|(ix, _)| ix);
-									if let Some(ix) = ix {
-										self.followed.inner.swap_remove(ix);
+						Ok(query) => {
+							println!("{query:#?}");
+							match query {
+								SocketQuery::Feeds(fc) => match fc {
+									FeedsCommand::Follow { name, url } => {
+										let id = uuid::Uuid::new_v4();
+										let entry = FollowedEntry {
+											id,
+											name,
+											url,
+											read_from: SysTime(SystemTime::now()),
+										};
+										self.followed.inner.push(entry);
 										self.followed.write_to_file()?;
-										Self::write_to_stream(&mut stream, Response::Ack)?;
-									} else {
+										Self::write_to_stream(&mut stream, Response::NewId(id))?;
+									}
+									FeedsCommand::Unfollow { id } => {
+										let ix = self
+											.followed
+											.inner
+											.iter()
+											.enumerate()
+											.find(|(_, e)| e.id == id)
+											.map(|(ix, _)| ix);
+										if let Some(ix) = ix {
+											self.followed.inner.swap_remove(ix);
+											self.followed.write_to_file()?;
+											Self::write_to_stream(&mut stream, Response::Ack)?;
+										} else {
+											Self::write_to_stream(
+												&mut stream,
+												Response::Bad(SyndError::InvalidParameter),
+											)?;
+										}
+									}
+									FeedsCommand::List => {
 										Self::write_to_stream(
 											&mut stream,
-											Response::Bad(SyndError::InvalidParameter),
+											Response::FollowDbList(self.followed.inner.clone()),
 										)?;
 									}
-								}
-								FeedsCommand::List => {
-									Self::write_to_stream(
-										&mut stream,
-										Response::FollowDbList(self.followed.inner.clone()),
-									)?;
-								}
-								FeedsCommand::Update {
-									id_to_update,
-									name,
-									url,
-									read_from,
-								} => {
-									// should probably turn this into a hashmap after reading
-									match self
-										.followed
-										.inner
-										.iter_mut()
-										.find(|f| f.uuid == id_to_update)
-									{
-										Some(e) => {
-											if let Some(name) = name {
-												e.name =
-													if name.is_empty() { None } else { Some(name) };
-											};
-											if let Some(url) = url {
-												e.url = url;
-											};
-											if let Some(read_from) = read_from {
-												e.read_from = read_from;
-											};
-											Self::write_to_stream(&mut stream, Response::Ack)?;
-										}
-										None => Self::write_to_stream(
+									FeedsCommand::Update {
+										id_to_update,
+										name,
+										url,
+										read_from,
+									} => {
+										// should probably turn this into a hashmap after reading
+										match self
+											.followed
+											.inner
+											.iter_mut()
+											.find(|f| f.id == id_to_update)
+										{
+											Some(e) => {
+												if let Some(name) = name {
+													e.name = if name.is_empty() {
+														None
+													} else {
+														Some(name)
+													};
+												};
+												if let Some(url) = url {
+													e.url = url;
+												};
+												if let Some(read_from) = read_from {
+													e.read_from = read_from;
+												};
+												Self::write_to_stream(&mut stream, Response::Ack)?;
+											}
+											None => Self::write_to_stream(
+												&mut stream,
+												Response::Bad(SyndError::InvalidId),
+											)?,
+										};
+									}
+								},
+								SocketQuery::MainLoop(mlc) => match mlc {
+									MainLoopCommand::GetTimeUntilNextFetch => {
+										// this is probably fragile
+										let duration = self.config.fetch_interval
+											- self.last_fetch.unwrap().elapsed();
+										Self::write_to_stream(
 											&mut stream,
-											Response::Bad(SyndError::InvalidId),
-										)?,
-									};
-								}
-							},
-							SocketQuery::MainLoop(mlc) => match mlc {
-								MainLoopCommand::GetTimeUntilNextFetch => {
-									// this is probably fragile
-									let duration = self.config.fetch_interval
-										- self.last_fetch.unwrap().elapsed();
-									Self::write_to_stream(
-										&mut stream,
-										Response::TimeUntilFetch(duration.as_secs()),
-									)?;
-								}
-								MainLoopCommand::ForceFetch => {
-									self.last_fetch = None;
-									Self::write_to_stream(&mut stream, Response::Ack)?;
-								}
-							},
-						},
+											Response::TimeUntilFetch(duration.as_secs()),
+										)?;
+									}
+									MainLoopCommand::ForceFetch => {
+										self.last_fetch = None;
+										Self::write_to_stream(&mut stream, Response::Ack)?;
+									}
+								},
+							}
+						}
 						Err(er) => Self::write_to_stream(
 							&mut stream,
 							Response::Bad(SyndError::Generic(er.to_string())),
@@ -387,13 +407,12 @@ impl Synd {
 		{
 			return Ok(());
 		}
-		println!("==== fetching feeds ====");
+		// println!("==== fetching feeds ====");
 		self.last_fetch = Some(Instant::now());
 
-		let mut new = false;
-
+		let mut items = Vec::new();
 		for followed in &self.followed.inner {
-			println!("==== iter ====");
+			// println!("==== iter ====");
 			let res = match minreq::get(&followed.url).send() {
 				Ok(r) => r,
 				Err(er) => {
@@ -414,25 +433,19 @@ impl Synd {
 			};
 			#[allow(unused)]
 			#[allow(clippy::all)]
-			let items = if let Ok(feed) =
-				atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed)))
-			{
+			if let Ok(feed) = atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed))) {
 				let entries = feed
 					.entries()
 					.iter()
 					.filter_map(|e| {
-						let ident = ReadIdent::AtomId(e.id().to_owned());
+						let ident = EntryIdent::AtomId(e.id().to_owned());
 						let title = e.title.to_string();
 						match e.links.first().map(|l| l.href().to_owned()) {
 							Some(url) => Some(SendEntry {
 								ident,
 								title,
 								url,
-								// todo consider missing summary
-								summary: e
-									.summary()
-									.map(|s| s.to_string().clone())
-									.unwrap_or_default(),
+								summary: e.summary().map(|s| s.to_string().clone()),
 							}),
 							None => {
 								// link is required according to wikipedia
@@ -445,16 +458,17 @@ impl Synd {
 						}
 					})
 					.collect::<Vec<_>>();
-				println!("=============== ATOM ENTRIES ===============\n\n\n{entries:#?}");
+				items.extend(entries);
+				// println!("=============== ATOM ENTRIES ===============\n\n\n{entries:#?}");
 			} else if let Ok(feed) = rss::Channel::read_from(BufReader::new(Cursor::new(feed))) {
 				let entries = feed
 					.items()
 					.iter()
 					.filter_map(|i| {
 						let ident = if let Some(guid) = i.guid() {
-							ReadIdent::RssGuid(guid.value().to_owned())
+							EntryIdent::RssGuid(guid.value().to_owned())
 						} else if let Some(link) = i.link() {
-							ReadIdent::RssLink(link.to_owned())
+							EntryIdent::RssLink(link.to_owned())
 						} else {
 							eprintln!(
 								"=er= unidentifiable item in rss feed under {} =er=",
@@ -472,21 +486,21 @@ impl Synd {
 						// also defined as mandatory
 						let summary = if let Some(desc) = i.description() {
 							if desc.len() > self.config.max_summary_length {
-								desc[..self.config.max_summary_length].to_owned()
+								Some(desc[..self.config.max_summary_length].to_owned())
 							} else {
-								desc.to_owned()
+								Some(desc.to_owned())
 							}
 						} else if let Some(cont) = i.content() {
 							if cont.len() > self.config.max_inferred_summary_length {
 								let mut string =
 									cont[..self.config.max_inferred_summary_length].to_owned();
 								string.push_str("...");
-								string
+								Some(string)
 							} else {
-								cont.to_owned()
+								Some(cont.to_owned())
 							}
 						} else {
-							String::from("[no description]")
+							None
 						};
 						Some(SendEntry {
 							ident,
@@ -496,12 +510,15 @@ impl Synd {
 						})
 					})
 					.collect::<Vec<_>>();
-				println!("=============== RSS ENTRIES ===============\n\n\n{entries:#?}");
+				println!("e {entries:#?}");
+				items.extend(entries);
+				// println!("=============== RSS ENTRIES ===============\n\n\n{entries:#?}");
 			} else {
 				eprintln!("=er= invalid feed under {}", followed.url);
 			};
 			// println!("{atom:#?}");
 		}
+		println!("{items:#?}");
 		// Err(anyhow::Error::msg("intentional"))
 		Ok(())
 	}
