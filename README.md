@@ -22,7 +22,8 @@ the above two may become optional and None by default in the future.
 
 ## actions
 an action is an executable file, for example a shell script.  
-json-serialized data are passed through stdin. 
+json-serialized data are passed through stdin.  
+
 example nuscript for sending notifications (good for a setup with a notification manager):
 ```nu
 #!/usr/bin/env -S nu --stdin
