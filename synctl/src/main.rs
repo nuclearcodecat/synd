@@ -74,6 +74,50 @@ fn options() -> OptionParser<synd::SocketQuery> {
 			.map(synd::SocketQuery::Feeds)
 	};
 
+	let reads = {
+		let mark_read = {
+			let id = long("id")
+				.short('i')
+				.help("guid of the article to mark as read. use the same id as given by List")
+				.argument("ID");
+
+			construct!(synd::ReadsCommand::MarkRead { id })
+				.to_options()
+				.command("mark-read")
+		};
+
+		let mark_unread = {
+			let id = long("id")
+				.short('i')
+				.help("guid of the article to mark as unread. use the same id as given by List")
+				.argument("ID");
+
+			construct!(synd::ReadsCommand::MarkUnread { id })
+				.to_options()
+				.command("mark-unread")
+		};
+
+		let list_all = construct!(synd::ReadsCommand::ListAll {})
+			.to_options()
+			.command("list");
+
+		let list_from_feed = {
+			let followed_id = long("id")
+				.short('i')
+				.help("id of the feed to list read articles from")
+				.argument("ID");
+
+			construct!(synd::ReadsCommand::ListFromFeed { followed_id })
+				.to_options()
+				.command("list-from-feed")
+		};
+
+		construct!([mark_read, mark_unread, list_all, list_from_feed])
+			.to_options()
+			.command("reads")
+			.map(synd::SocketQuery::Reads)
+	};
+
 	let mainloop = {
 		let get_time = construct!(synd::MainLoopCommand::GetTimeUntilNextFetch {})
 			.to_options()
@@ -88,7 +132,7 @@ fn options() -> OptionParser<synd::SocketQuery> {
 			.map(synd::SocketQuery::MainLoop)
 	};
 
-	construct!([feeds, mainloop]).to_options()
+	construct!([feeds, reads, mainloop]).to_options()
 }
 
 fn main() -> anyhow::Result<()> {

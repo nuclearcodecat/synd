@@ -1,5 +1,7 @@
 use std::{
+	collections::HashMap,
 	fs::{self, File, OpenOptions},
+	hash::Hash,
 	io::{Seek, Write},
 	sync::LazyLock,
 	time::{SystemTime, UNIX_EPOCH},
@@ -8,12 +10,16 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::synd::CONFIGDIR;
+use crate::synd::DATADIR;
+
+pub trait SerdeK = for<'a> Deserialize<'a> + Serialize + Hash + Eq;
+pub trait SerdeV = for<'a> Deserialize<'a> + Serialize;
 
 #[derive(Debug)]
-pub struct Db<T: for<'a> Deserialize<'a> + Serialize> {
-	pub inner: Vec<T>,
+pub struct Db<K: SerdeK, V: SerdeV> {
+	pub inner: HashMap<K, V>,
 	pub file: File,
+	pub name: &'static str,
 }
 
 static OPENOPT: LazyLock<OpenOptions> = LazyLock::new(|| {
@@ -22,13 +28,15 @@ static OPENOPT: LazyLock<OpenOptions> = LazyLock::new(|| {
 	oo
 });
 
-impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
+impl<K: SerdeK, V: SerdeV> Db<K, V> {
 	pub fn new(fname: &'static str) -> anyhow::Result<Self> {
-		let fp = CONFIGDIR.clone().join(fname);
+		let fp = DATADIR.clone();
+		fs::create_dir_all(&fp).with_context(|| "while creating synd data dir")?;
+		let fp = fp.join(fname);
 		// println!("{fp:?}");
 		let mut file = OPENOPT
 			.open(&fp)
-			.with_context(|| "while opening followed.db file")?;
+			.with_context(|| format!("while opening {fname} file ({fp:?}))"))?;
 		let mut make_instantly = false;
 		let inner = match serde_json::from_reader(file.try_clone()?) {
 			Ok(i) => i,
@@ -39,7 +47,6 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 					.with_context(|| "while checking stream len")?
 					> 0
 				{
-					println!("==== saving old contents to .bak file ====");
 					let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 					let mut fp_bak = fp.clone();
 					let mut bak = fp_bak
@@ -51,15 +58,20 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 					bak.push_str(&now.to_string());
 					fp_bak.set_file_name(&bak);
 					fp_bak.set_extension("bak");
+					println!("==== saving old contents to {fp_bak:?} file ====");
 					fs::copy(&fp, &fp_bak).unwrap_or_else(|_| {
 						panic!("=er= failed to write {fname} backup. exiting immediately =er=")
 					});
 				}
 				make_instantly = true;
-				Vec::new()
+				HashMap::new()
 			}
 		};
-		let mut new = Self { inner, file };
+		let mut new = Self {
+			inner,
+			file,
+			name: fname,
+		};
 		if make_instantly {
 			println!("==== creating new db file ====");
 			new.write_to_file()
@@ -69,15 +81,18 @@ impl<T: Serialize + for<'a> Deserialize<'a>> Db<T> {
 	}
 
 	pub fn write_to_file(&mut self) -> anyhow::Result<()> {
+		let fname = self.name;
 		let ser = serde_json::to_string_pretty(&self.inner)
-			.with_context(|| "while serializing db file")?;
-		self.file.rewind().with_context(|| "while rewinding Seek")?;
+			.with_context(|| format!("while serializing {fname} file"))?;
+		self.file
+			.rewind()
+			.with_context(|| format!("while rewinding Seek for {fname}"))?;
 		self.file
 			.set_len(0)
-			.with_context(|| "while truncating file")?;
+			.with_context(|| format!("while truncating {fname} file"))?;
 		self.file
 			.write(ser.as_bytes())
-			.with_context(|| "while writing to db file")?;
+			.with_context(|| format!("while writing to {fname} file"))?;
 		Ok(())
 	}
 }

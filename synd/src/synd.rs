@@ -3,7 +3,7 @@
 // todos
 //  - search for todo in %
 //  - store dbs in .local (i think i shall)
-//  - mark whether an Action was already triggered for an entry (true by default for all entries when first following)
+//  - use hashmaps instead of vec for read/actioned
 //
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -15,11 +15,11 @@ use std::{
 	path::PathBuf,
 	process::{Command, Stdio},
 	sync::LazyLock,
-	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+	time::{Duration, Instant, UNIX_EPOCH},
 };
 use synd_common::{
-	FeedsCommand, FollowId, FollowedEntry, MainLoopCommand, Response, SocketQuery, SyndError,
-	systime::SysTime,
+	EntryIdent, FeedsCommand, FollowId, FollowedEntry, MainLoopCommand, ReadEntry, Response,
+	SocketQuery, SyndError, systime::SysTime,
 };
 
 use crate::db::Db;
@@ -27,10 +27,18 @@ use crate::db::Db;
 pub static HOMEDIR: LazyLock<PathBuf> = LazyLock::new(|| env::home_dir().expect("$HOME not set"));
 
 pub static CONFIGDIR: LazyLock<PathBuf> = LazyLock::new(|| match env::var("XDG_CONFIG_DIR") {
-	Ok(d) => PathBuf::from(d),
+	Ok(d) => PathBuf::from(d).join("synd"),
 	Err(_) => {
 		let homedir = HOMEDIR.clone();
 		homedir.join(".config/synd")
+	}
+});
+
+pub static DATADIR: LazyLock<PathBuf> = LazyLock::new(|| match env::var("XDG_DATA_HOME") {
+	Ok(d) => PathBuf::from(d).join("synd"),
+	Err(_) => {
+		let homedir = HOMEDIR.clone();
+		homedir.join(".local/share/synd")
 	}
 });
 
@@ -40,9 +48,10 @@ pub struct Synd {
 	sockpath: PathBuf,
 	sock: UnixListener,
 	last_fetch: Option<Instant>,
-	followed: Db<FollowedEntry>,
-	read: Db<ReadEntry>,
-	actioned: Db<ActionedEntry>,
+	followed: Db<FollowId, FollowedEntry>,
+	read: Db<EntryIdent, ReadEntry>,
+	actioned: Db<EntryIdent, ActionedEntry>,
+	feeds: Vec<SendEntry>,
 }
 
 impl Drop for Synd {
@@ -55,25 +64,9 @@ impl Drop for Synd {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-enum EntryIdent {
-	// AtomId(uuid::Uuid),
-	AtomId(String),
-	RssGuid(String),
-	RssLink(String),
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ReadEntry {
-	follow_id: FollowId,
-	ident: EntryIdent,
-	added_at: SysTime,
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 struct ActionedEntry {
 	follow_id: FollowId,
-	ident: EntryIdent,
 	added_at: SysTime,
 }
 
@@ -84,6 +77,7 @@ struct SendEntry {
 	url: String,
 	summary: Option<String>,
 	pub_time: Option<atom_syndication::FixedDateTime>,
+	followed_id: FollowId,
 }
 
 #[derive(Debug)]
@@ -218,24 +212,6 @@ impl Config {
 }
 
 impl Synd {
-	fn get_followed() -> anyhow::Result<Db<FollowedEntry>> {
-		let new = Db::new("followed.db")?;
-		Ok(new)
-	}
-
-	fn get_read() -> anyhow::Result<Db<ReadEntry>> {
-		// let to_ser = ReadEntry {
-		// 	follow_id: uuid::Uuid::new_v4(),
-		// 	read_id: ReadIdent::AtomId(uuid::Uuid::new_v4().to_string()),
-		// 	added_at: SysTime::now(),
-		// };
-		// let x = serde_json::to_string_pretty(&to_ser).unwrap();
-		// println!("ser\n{x}");
-		let new = Db::new("read.db")?;
-		// println!("read: {new:#?}");
-		Ok(new)
-	}
-
 	fn get_sockpath() -> anyhow::Result<PathBuf> {
 		let rtdir = PathBuf::from(
 			std::env::var("XDG_RUNTIME_DIR")
@@ -260,11 +236,12 @@ impl Synd {
 		let new = Self {
 			config: Config::parse().with_context(|| "while getting config")?,
 			last_fetch: None,
-			followed: Self::get_followed()?,
-			read: Self::get_read()?,
+			followed: Db::new("followed.db")?,
+			read: Db::new("read.db")?,
 			actioned: Db::new("actioned.db")?,
 			sock: Self::get_sock(&sockpath)?,
 			sockpath,
+			feeds: Vec::new(),
 		};
 		println!("{new:#?}");
 
@@ -298,25 +275,16 @@ impl Synd {
 									FeedsCommand::Follow { name, url } => {
 										let id = uuid::Uuid::new_v4();
 										let entry = FollowedEntry {
-											id,
 											name,
 											url,
 											read_from: SysTime::now(),
 										};
-										self.followed.inner.push(entry);
+										self.followed.inner.insert(id, entry);
 										self.followed.write_to_file()?;
 										Self::write_to_stream(&mut stream, Response::NewId(id))?;
 									}
 									FeedsCommand::Unfollow { id } => {
-										let ix = self
-											.followed
-											.inner
-											.iter()
-											.enumerate()
-											.find(|(_, e)| e.id == id)
-											.map(|(ix, _)| ix);
-										if let Some(ix) = ix {
-											self.followed.inner.swap_remove(ix);
+										if self.followed.inner.remove(&id).is_some() {
 											self.followed.write_to_file()?;
 											Self::write_to_stream(&mut stream, Response::Ack)?;
 										} else {
@@ -338,13 +306,7 @@ impl Synd {
 										url,
 										read_from,
 									} => {
-										// should probably turn this into a hashmap after reading
-										match self
-											.followed
-											.inner
-											.iter_mut()
-											.find(|f| f.id == id_to_update)
-										{
+										match self.followed.inner.get_mut(&id_to_update) {
 											Some(e) => {
 												if let Some(name) = name {
 													e.name = if name.is_empty() {
@@ -363,7 +325,7 @@ impl Synd {
 											}
 											None => Self::write_to_stream(
 												&mut stream,
-												Response::Bad(SyndError::InvalidId),
+												Response::Bad(SyndError::InvalidParameter),
 											)?,
 										};
 									}
@@ -385,15 +347,49 @@ impl Synd {
 								},
 								SocketQuery::Reads(cmd) => match cmd {
 									synd_common::ReadsCommand::MarkRead { id } => {
-										self.read.inner.push(ReadEntry {
-											follow_id: todo!(),
-											ident: todo!(),
-											added_at: SysTime::now(),
-										});
+										match self.feeds.iter().find(|e| e.ident == id) {
+											Some(e) => {
+												let fid = e.followed_id;
+												self.read.inner.insert(
+													id,
+													ReadEntry {
+														followed_id: fid,
+														added_at: SysTime::now(),
+													},
+												);
+												Self::write_to_stream(&mut stream, Response::Ack)?;
+											}
+											None => {
+												Self::write_to_stream(
+													&mut stream,
+													Response::Bad(SyndError::InvalidParameter),
+												)?;
+											}
+										};
 									}
-									synd_common::ReadsCommand::MarkUnread { id } => {}
-									synd_common::ReadsCommand::ListAll => {}
-									synd_common::ReadsCommand::ListFromFeed { followed_id } => {}
+									synd_common::ReadsCommand::MarkUnread { id } => {
+										if self.read.inner.remove(&id).is_some() {
+											self.read.write_to_file()?;
+											Self::write_to_stream(&mut stream, Response::Ack)?;
+										} else {
+											Self::write_to_stream(
+												&mut stream,
+												Response::Bad(SyndError::InvalidParameter),
+											)?;
+										}
+									}
+									synd_common::ReadsCommand::ListAll => Self::write_to_stream(
+										&mut stream,
+										Response::ReadDbList(self.read.inner.clone()),
+									)?,
+									synd_common::ReadsCommand::ListFromFeed { followed_id } => {
+										let mut map = self.read.inner.clone();
+										map.retain(|_, e| e.followed_id == followed_id);
+										Self::write_to_stream(
+											&mut stream,
+											Response::ReadDbList(map),
+										)?
+									}
 								},
 							}
 						}
@@ -443,7 +439,7 @@ impl Synd {
 		// println!("==== fetching feeds ====");
 		self.last_fetch = Some(Instant::now());
 
-		for followed in &self.followed.inner {
+		for (followed_id, followed) in &self.followed.inner {
 			// println!("==== iter ====");
 			let res = match minreq::get(&followed.url).send() {
 				Ok(r) => r,
@@ -475,6 +471,7 @@ impl Synd {
 						let title = e.title.to_string();
 						match e.links.first().map(|l| l.href().to_owned()) {
 							Some(url) => Some(SendEntry {
+								followed_id: *followed_id,
 								ident,
 								title,
 								url,
@@ -536,24 +533,25 @@ impl Synd {
 						} else {
 							None
 						};
+						let pub_time = i.pub_date().and_then(|d| {
+							Some(
+								match atom_syndication::FixedDateTime::parse_from_rfc2822(d) {
+									Ok(d) => d,
+									Err(er) => {
+										eprintln!("=er= failed to parse rss pub date ({er}) =er=");
+										return None;
+									}
+								},
+							)
+						});
+						println!("pub date for '{title}': {pub_time:?}, {:?}", i.pub_date());
 						Some(SendEntry {
+							followed_id: *followed_id,
 							ident,
 							title,
 							url,
 							summary,
-							pub_time: i.pub_date().and_then(|d| {
-								Some(
-									match atom_syndication::FixedDateTime::parse_from_rfc2822(d) {
-										Ok(d) => d,
-										Err(er) => {
-											eprintln!(
-												"=er= failed to parse rss pub date {er} =er="
-											);
-											return None;
-										}
-									},
-								)
-							}),
+							pub_time,
 						})
 					})
 					.collect::<Vec<_>>();
@@ -567,8 +565,9 @@ impl Synd {
 
 			let read_from_dur = followed.read_from.duration_since(UNIX_EPOCH)?.as_secs();
 
-			for entry in items {
-				let is_in_actioned = self.actioned.inner.iter().any(|ae| ae.ident == entry.ident);
+			self.feeds = items;
+			for entry in &self.feeds {
+				let is_in_actioned = self.actioned.inner.iter().any(|(k, _)| k == &entry.ident);
 				if is_in_actioned {
 					println!("entry {entry:?} was already actioned");
 					continue;
@@ -581,12 +580,14 @@ impl Synd {
 					println!("entry {entry:?} is old");
 				} else {
 					println!("entry {entry:?} should get actioned and added to the db");
-					self.action(&entry).with_context(|| "while actioning")?;
-					self.actioned.inner.push(ActionedEntry {
-						follow_id: followed.id,
-						ident: entry.ident,
-						added_at: SysTime::now(),
-					});
+					self.action(entry).with_context(|| "while actioning")?;
+					self.actioned.inner.insert(
+						entry.ident.clone(),
+						ActionedEntry {
+							follow_id: *followed_id,
+							added_at: SysTime::now(),
+						},
+					);
 					self.actioned.write_to_file()?;
 				}
 			}

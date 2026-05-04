@@ -1,5 +1,6 @@
 #![feature(duration_constructors)]
 #![feature(seek_stream_len)]
+#![feature(trait_alias)]
 
 use std::{
 	sync::atomic::{AtomicBool, Ordering},
