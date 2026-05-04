@@ -2,8 +2,6 @@
 
 // todos
 //  - search for todo in %
-//  - store dbs in .local (i think i shall)
-//  - use hashmaps instead of vec for read/actioned
 //
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -124,8 +122,8 @@ impl Config {
 				configdir = configdir.join(filetail);
 				self.action = Some(configdir);
 			}
+			// todo currently unimplemented and ambiguous whether it should work for actioned, read, or both
 			"removal threshold" => {
-				// 90 days
 				let thr = ass.as_bytes();
 				let kar = thr[thr.len() - 1] as char;
 				let is_in_seconds = kar == 's';
@@ -459,8 +457,6 @@ impl Synd {
 					continue;
 				}
 			};
-			#[allow(unused)]
-			#[allow(clippy::all)]
 			let mut items = Vec::new();
 			if let Ok(feed) = atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed))) {
 				let entries = feed
@@ -544,7 +540,7 @@ impl Synd {
 								},
 							)
 						});
-						println!("pub date for '{title}': {pub_time:?}, {:?}", i.pub_date());
+						// println!("pub date for '{title}': {pub_time:?}, {:?}", i.pub_date());
 						Some(SendEntry {
 							followed_id: *followed_id,
 							ident,
@@ -555,7 +551,7 @@ impl Synd {
 						})
 					})
 					.collect::<Vec<_>>();
-				println!("e {entries:#?}");
+				// println!("e {entries:#?}");
 				items.extend(entries);
 				// println!("=============== RSS ENTRIES ===============\n\n\n{entries:#?}");
 			} else {
@@ -569,7 +565,7 @@ impl Synd {
 			for entry in &self.feeds {
 				let is_in_actioned = self.actioned.inner.iter().any(|(k, _)| k == &entry.ident);
 				if is_in_actioned {
-					println!("entry {entry:?} was already actioned");
+					// println!("entry {entry:?} was already actioned");
 					continue;
 				}
 				let is_old = match entry.pub_time {
@@ -577,9 +573,9 @@ impl Synd {
 					None => true,
 				};
 				if is_old {
-					println!("entry {entry:?} is old");
+					// println!("entry {entry:?} is old");
 				} else {
-					println!("entry {entry:?} should get actioned and added to the db");
+					// println!("entry {entry:?} should get actioned and added to the db");
 					self.action(entry).with_context(|| "while actioning")?;
 					self.actioned.inner.insert(
 						entry.ident.clone(),
@@ -592,14 +588,15 @@ impl Synd {
 				}
 			}
 		}
-		println!("{:#?}", self.actioned.inner);
+		// println!("{:#?}", self.actioned.inner);
 		// Err(anyhow::Error::msg("intentional"))
 		Ok(())
 	}
 
 	pub fn work(&mut self) -> anyhow::Result<()> {
-		self.handle_streams()?;
-		self.check_feeds()?;
+		self.handle_streams()
+			.with_context(|| "while handling streams")?;
+		self.check_feeds().with_context(|| "while checking feeds")?;
 		Ok(())
 	}
 }
