@@ -9,8 +9,18 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::Error as _};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SysTime(pub SystemTime);
+
+impl SysTime {
+	// fn new(st: SystemTime) -> Self {
+	// 	Self(st)
+	// }
+
+	pub fn now() -> Self {
+		Self(SystemTime::now())
+	}
+}
 
 impl Deref for SysTime {
 	type Target = SystemTime;

@@ -13,8 +13,9 @@ use std::{
 	io::{BufRead, BufReader, Cursor, Read, Write},
 	os::unix::net::{UnixListener, UnixStream},
 	path::PathBuf,
+	process::{Command, Stdio},
 	sync::LazyLock,
-	time::{Duration, Instant, SystemTime},
+	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use synd_common::{
 	FeedsCommand, FollowId, FollowedEntry, MainLoopCommand, Response, SocketQuery, SyndError,
@@ -54,7 +55,7 @@ impl Drop for Synd {
 	}
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 enum EntryIdent {
 	// AtomId(uuid::Uuid),
 	AtomId(String),
@@ -82,6 +83,7 @@ struct SendEntry {
 	title: String,
 	url: String,
 	summary: Option<String>,
+	pub_time: Option<atom_syndication::FixedDateTime>,
 }
 
 #[derive(Debug)]
@@ -225,7 +227,7 @@ impl Synd {
 		// let to_ser = ReadEntry {
 		// 	follow_id: uuid::Uuid::new_v4(),
 		// 	read_id: ReadIdent::AtomId(uuid::Uuid::new_v4().to_string()),
-		// 	added_at: SysTime(SystemTime::now()),
+		// 	added_at: SysTime::now(),
 		// };
 		// let x = serde_json::to_string_pretty(&to_ser).unwrap();
 		// println!("ser\n{x}");
@@ -292,14 +294,14 @@ impl Synd {
 						Ok(query) => {
 							println!("{query:#?}");
 							match query {
-								SocketQuery::Feeds(fc) => match fc {
+								SocketQuery::Feeds(cmd) => match cmd {
 									FeedsCommand::Follow { name, url } => {
 										let id = uuid::Uuid::new_v4();
 										let entry = FollowedEntry {
 											id,
 											name,
 											url,
-											read_from: SysTime(SystemTime::now()),
+											read_from: SysTime::now(),
 										};
 										self.followed.inner.push(entry);
 										self.followed.write_to_file()?;
@@ -366,7 +368,7 @@ impl Synd {
 										};
 									}
 								},
-								SocketQuery::MainLoop(mlc) => match mlc {
+								SocketQuery::MainLoop(cmd) => match cmd {
 									MainLoopCommand::GetTimeUntilNextFetch => {
 										// this is probably fragile
 										let duration = self.config.fetch_interval
@@ -380,6 +382,18 @@ impl Synd {
 										self.last_fetch = None;
 										Self::write_to_stream(&mut stream, Response::Ack)?;
 									}
+								},
+								SocketQuery::Reads(cmd) => match cmd {
+									synd_common::ReadsCommand::MarkRead { id } => {
+										self.read.inner.push(ReadEntry {
+											follow_id: todo!(),
+											ident: todo!(),
+											added_at: SysTime::now(),
+										});
+									}
+									synd_common::ReadsCommand::MarkUnread { id } => {}
+									synd_common::ReadsCommand::ListAll => {}
+									synd_common::ReadsCommand::ListFromFeed { followed_id } => {}
 								},
 							}
 						}
@@ -401,6 +415,25 @@ impl Synd {
 		Ok(())
 	}
 
+	fn action(&self, send_entry: &SendEntry) -> anyhow::Result<()> {
+		let act = &self.config.action;
+		if let Some(act) = act {
+			let cmd = Command::new(act)
+				.stdin(Stdio::piped())
+				.spawn()
+				.with_context(|| "while spawning action process")?;
+			let serialized = serde_json::to_string(send_entry)
+				.with_context(|| "while serializing SendEntry for stdin")?;
+			cmd.stdin
+				.with_context(|| "while taking stdin from actioned process")?
+				.write_all(serialized.as_bytes())
+				.with_context(|| "while writing data to child stdin")?;
+		} else {
+			println!("no action specified");
+		}
+		Ok(())
+	}
+
 	fn check_feeds(&mut self) -> anyhow::Result<()> {
 		if let Some(last_fetch) = self.last_fetch
 			&& last_fetch.elapsed() < self.config.fetch_interval
@@ -410,7 +443,6 @@ impl Synd {
 		// println!("==== fetching feeds ====");
 		self.last_fetch = Some(Instant::now());
 
-		let mut items = Vec::new();
 		for followed in &self.followed.inner {
 			// println!("==== iter ====");
 			let res = match minreq::get(&followed.url).send() {
@@ -433,6 +465,7 @@ impl Synd {
 			};
 			#[allow(unused)]
 			#[allow(clippy::all)]
+			let mut items = Vec::new();
 			if let Ok(feed) = atom_syndication::Feed::read_from(BufReader::new(Cursor::new(feed))) {
 				let entries = feed
 					.entries()
@@ -446,6 +479,7 @@ impl Synd {
 								title,
 								url,
 								summary: e.summary().map(|s| s.to_string().clone()),
+								pub_time: e.published().copied(),
 							}),
 							None => {
 								// link is required according to wikipedia
@@ -507,6 +541,19 @@ impl Synd {
 							title,
 							url,
 							summary,
+							pub_time: i.pub_date().and_then(|d| {
+								Some(
+									match atom_syndication::FixedDateTime::parse_from_rfc2822(d) {
+										Ok(d) => d,
+										Err(er) => {
+											eprintln!(
+												"=er= failed to parse rss pub date {er} =er="
+											);
+											return None;
+										}
+									},
+								)
+							}),
 						})
 					})
 					.collect::<Vec<_>>();
@@ -516,9 +563,35 @@ impl Synd {
 			} else {
 				eprintln!("=er= invalid feed under {}", followed.url);
 			};
-			// println!("{atom:#?}");
+			// println!("{items:#?}");
+
+			let read_from_dur = followed.read_from.duration_since(UNIX_EPOCH)?.as_secs();
+
+			for entry in items {
+				let is_in_actioned = self.actioned.inner.iter().any(|ae| ae.ident == entry.ident);
+				if is_in_actioned {
+					println!("entry {entry:?} was already actioned");
+					continue;
+				}
+				let is_old = match entry.pub_time {
+					Some(ts) => (ts.timestamp() as u64) < read_from_dur,
+					None => true,
+				};
+				if is_old {
+					println!("entry {entry:?} is old");
+				} else {
+					println!("entry {entry:?} should get actioned and added to the db");
+					self.action(&entry).with_context(|| "while actioning")?;
+					self.actioned.inner.push(ActionedEntry {
+						follow_id: followed.id,
+						ident: entry.ident,
+						added_at: SysTime::now(),
+					});
+					self.actioned.write_to_file()?;
+				}
+			}
 		}
-		println!("{items:#?}");
+		println!("{:#?}", self.actioned.inner);
 		// Err(anyhow::Error::msg("intentional"))
 		Ok(())
 	}

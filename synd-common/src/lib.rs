@@ -45,6 +45,7 @@ pub struct FollowedEntry {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum SocketQuery {
 	Feeds(FeedsCommand),
+	Reads(ReadsCommand),
 	MainLoop(MainLoopCommand),
 }
 
@@ -64,6 +65,14 @@ pub enum FeedsCommand {
 		read_from: Option<SysTime>,
 	},
 	List,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ReadsCommand {
+	MarkRead { id: uuid::Uuid },
+	MarkUnread { id: uuid::Uuid },
+	ListAll,
+	ListFromFeed { followed_id: uuid::Uuid },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
